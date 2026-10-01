@@ -98,11 +98,55 @@ function contentTypeFor(url) {
   return /\.flv$/i.test(url.pathname) ? "video/x-flv" : "video/mp4";
 }
 
+function clientIp(socket) {
+  const address = String(socket?.remoteAddress || socket?._parent?.remoteAddress || "");
+  return address.replace(/^::ffff:/i, "");
+}
+
 function createProxyServer(options) {
   const { authority, cache, upstream, shared } = options;
   const log = typeof options.log === "function" ? options.log : () => {};
-  const stats = { connections: 0, tlsIntercepted: 0, tunnels: 0, spliced: 0, accelerated: 0, passthrough: 0, fallbacks: 0, loops: 0 };
+  const stats = { connections: 0, tlsIntercepted: 0, tunnels: 0, spliced: 0, accelerated: 0, passthrough: 0, fallbacks: 0, loops: 0, bypassed: 0 };
   const contexts = new Map();
+
+  // Devices that do not trust the proxy's certificate (an Android app, a TV) fail the TLS
+  // handshake on every connection, and in the DNS and transparent deployments their video
+  // would simply stop. After a few failures in a row such a device is let through to the
+  // real servers for a while, unaccelerated but working, and shown on the status page.
+  const bypass = {
+    after: Math.max(0, Math.trunc(Number(options.bypassAfter ?? 3)) || 0),
+    ms: Math.max(1000, Number(options.bypassMs) || 15 * 60 * 1000),
+    windowMs: 120000
+  };
+  const clients = new Map();
+  function clientRecord(ip) {
+    let record = clients.get(ip);
+    if (!record) {
+      record = { ip, failures: [], total: 0, bypasses: 0, until: 0, lastError: "", lastFailureAt: 0 };
+      if (clients.size >= 1024) clients.delete(clients.keys().next().value);
+      clients.set(ip, record);
+    }
+    return record;
+  }
+  function isBypassed(ip) {
+    const record = clients.get(ip);
+    return Boolean(record && record.until > Date.now());
+  }
+  function noteHandshakeFailure(ip, error) {
+    if (!bypass.after || !ip) return;
+    const now = Date.now();
+    const record = clientRecord(ip);
+    record.failures = record.failures.filter((at) => now - at < bypass.windowMs);
+    record.failures.push(now);
+    record.total += 1;
+    record.lastFailureAt = now;
+    record.lastError = String(error?.code || error?.message || error || "").slice(0, 80);
+    if (record.until > now || record.failures.length < bypass.after) return;
+    record.until = now + bypass.ms;
+    record.bypasses += 1;
+    record.failures = [];
+    log("warn", `设备 ${ip} 连续 ${bypass.after} 次 TLS 握手失败（${record.lastError}），接下来 ${Math.round(bypass.ms / 60000)} 分钟对它直接放行，不加速。请在这台设备上安装并信任代理的证书。`);
+  }
 
   function secureContextFor(servername) {
     const host = String(servername || "").toLowerCase();
@@ -127,8 +171,11 @@ function createProxyServer(options) {
   }, (request, response) => handleRequest(request, response, "https"));
   httpsServer.on("tlsClientError", (error, socket) => {
     const name = socket?.servername || "";
-    // A client that does not trust the CA yet fails here; worth a line, not a stack.
-    log("debug", `TLS 握手失败${name ? `（${name}）` : ""}：${error?.message || error}`);
+    const ip = clientIp(socket);
+    // A client that does not trust the CA fails here, with an "unknown ca" or "bad
+    // certificate" alert, or by closing the connection; worth a line, not a stack.
+    log("debug", `TLS 握手失败${name ? `（${name}）` : ""}${ip ? ` 来自 ${ip}` : ""}：${error?.message || error}`);
+    noteHandshakeFailure(ip, error);
   });
   const httpServer = http.createServer((request, response) => handleRequest(request, response, "http"));
   const proxyServer = http.createServer((request, response) => handleRequest(request, response, "proxy"));
@@ -273,10 +320,29 @@ function createProxyServer(options) {
   }
 
   // A socket that already belongs to the client, now served as a TLS connection of our own.
+  // A client that rejects the certificate drops the connection after the server's first
+  // flight. The proxy server's sockets allow half-open connections (as every http.Server's
+  // do), and the TLS socket inherits that, so such a drop would never close the server side:
+  // no failure would be seen, and the socket would stay open for good. Hence allowHalfOpen
+  // is cleared, and a handshake that has not completed within the limit is ended here.
+  const HANDSHAKE_TIMEOUT_MS = 15000;
+  const secured = new WeakSet();
+  httpsServer.on("secureConnection", (tlsSocket) => {
+    if (tlsSocket._parent) secured.add(tlsSocket._parent);
+  });
   function adopt(socket, head) {
     socket.removeAllListeners("data");
     socket.pause();
+    socket.allowHalfOpen = false;
     if (head?.length) socket.unshift(head);
+    const ip = clientIp(socket);
+    const timer = setTimeout(() => {
+      if (secured.has(socket) || socket.destroyed) return;
+      log("debug", `TLS 握手 ${HANDSHAKE_TIMEOUT_MS / 1000} 秒没有完成${ip ? `（${ip}）` : ""}，已关闭`);
+      noteHandshakeFailure(ip, "handshake timeout");
+      socket.destroy();
+    }, HANDSHAKE_TIMEOUT_MS);
+    socket.once("close", () => clearTimeout(timer));
     httpsServer.emit("connection", socket);
   }
 
@@ -295,9 +361,12 @@ function createProxyServer(options) {
     const target = splitHostPort(request.url, 443);
     if (!target) return socket.end("HTTP/1.1 400 Bad Request\r\n\r\n");
     if (target.port === 443 && isInterceptHost(target.host)) {
-      stats.tlsIntercepted += 1;
-      socket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
-      return adopt(socket, head);
+      if (isBypassed(clientIp(socket))) stats.bypassed += 1;
+      else {
+        stats.tlsIntercepted += 1;
+        socket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+        return adopt(socket, head);
+      }
     }
     stats.tunnels += 1;
     upstream.connect(target.host, target.port).then((server) => {
@@ -334,8 +403,11 @@ function createProxyServer(options) {
         return socket.destroy();
       }
       if (peek.sni && isInterceptHost(peek.sni)) {
-        stats.tlsIntercepted += 1;
-        return httpsServer.emit("connection", socket);
+        if (isBypassed(clientIp(socket))) stats.bypassed += 1;
+        else {
+          stats.tlsIntercepted += 1;
+          return adopt(socket);
+        }
       }
       if (!peek.sni) {
         log("debug", "TLS 连接没有带服务器名，无法知道要转发到哪里");
@@ -373,8 +445,13 @@ function createProxyServer(options) {
       if (httpPort != null) listening.http = await listenOn(httpServer, httpPort, host);
       return listening;
     },
+    isBypassed,
     status() {
-      return { ...stats, listening: { ...listening } };
+      const now = Date.now();
+      const untrusted = [...clients.values()]
+        .filter((record) => record.until > now || now - record.lastFailureAt < bypass.windowMs)
+        .map((record) => ({ ip: record.ip, bypassed: record.until > now, bypassForMs: Math.max(0, record.until - now), failures: record.total, bypasses: record.bypasses, lastError: record.lastError, lastFailureAt: record.lastFailureAt }));
+      return { ...stats, listening: { ...listening }, bypass: { after: bypass.after, ms: bypass.ms }, untrusted };
     },
     close() {
       for (const server of [proxyServer, transparentServer, httpServer, httpsServer]) {

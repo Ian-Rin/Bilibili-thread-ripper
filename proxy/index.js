@@ -15,6 +15,8 @@
 //   --read-ahead 2         预读：请求长度的倍数（0 关闭）
 //   --read-ahead-max 32    预读上限（MiB）
 //   --cache 512            内存缓存上限（MiB）
+//   --bypass-after 3       同一设备连续几次 TLS 握手失败后自动放行（不加速），0 关闭
+//   --bypass-minutes 15    放行多久
 //   --ca-dir proxy/ca      证书目录
 //   --listen 0.0.0.0       监听地址
 //   --verbose              打印每个请求
@@ -32,10 +34,10 @@ function parseArgs(argv) {
   const options = {
     proxyPort: 8080, tlsPort: 0, httpPort: 0, dnsPort: 0, adminPort: 8081,
     lanIp: "auto", dnsUpstream: "223.5.5.5,119.29.29.29",
-    mode: "mainland", hosts: "", threads: 16, readAhead: 2, readAheadMax: 32, cache: 512,
+    mode: "mainland", hosts: "", threads: 16, readAhead: 2, readAheadMax: 32, cache: 512, bypassAfter: 3, bypassMinutes: 15,
     caDir: path.resolve(__dirname, "ca"), listen: "0.0.0.0", verbose: false, help: false
   };
-  const names = { "proxy-port": "proxyPort", "tls-port": "tlsPort", "http-port": "httpPort", "dns-port": "dnsPort", "admin-port": "adminPort", "lan-ip": "lanIp", "dns-upstream": "dnsUpstream", mode: "mode", hosts: "hosts", threads: "threads", "read-ahead": "readAhead", "read-ahead-max": "readAheadMax", cache: "cache", "ca-dir": "caDir", listen: "listen" };
+  const names = { "proxy-port": "proxyPort", "tls-port": "tlsPort", "http-port": "httpPort", "dns-port": "dnsPort", "admin-port": "adminPort", "lan-ip": "lanIp", "dns-upstream": "dnsUpstream", mode: "mode", hosts: "hosts", threads: "threads", "read-ahead": "readAhead", "read-ahead-max": "readAheadMax", cache: "cache", "bypass-after": "bypassAfter", "bypass-minutes": "bypassMinutes", "ca-dir": "caDir", listen: "listen" };
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index];
     if (argument === "--verbose" || argument === "-v") { options.verbose = true; continue; }
@@ -45,7 +47,7 @@ function parseArgs(argv) {
     const value = match[2] !== undefined ? match[2] : argv[++index];
     if (value === undefined) throw new Error(`选项 ${argument} 需要一个值`);
     const key = names[match[1]];
-    options[key] = ["proxyPort", "tlsPort", "httpPort", "dnsPort", "adminPort", "threads", "readAhead", "readAheadMax", "cache"].includes(key) ? Number(value) : value;
+    options[key] = ["proxyPort", "tlsPort", "httpPort", "dnsPort", "adminPort", "threads", "readAhead", "readAheadMax", "cache", "bypassAfter", "bypassMinutes"].includes(key) ? Number(value) : value;
   }
   return options;
 }
@@ -106,7 +108,7 @@ async function main() {
     readAheadMaxBytes: options.readAheadMax * 1024 * 1024,
     maxCacheBytes: options.cache * 1024 * 1024
   });
-  const proxy = createProxyServer({ authority, cache, upstream, shared, log });
+  const proxy = createProxyServer({ authority, cache, upstream, shared, log, bypassAfter: options.bypassAfter, bypassMs: options.bypassMinutes * 60 * 1000 });
   let dns = null;
   const ports = { proxy: options.proxyPort, tls: options.tlsPort, http: options.httpPort, dns: options.dnsPort, admin: options.adminPort };
   try {
@@ -135,6 +137,7 @@ async function main() {
   if (options.httpPort) console.log(`  透明代理 HTTP 端口  ${options.httpPort}`);
   if (options.dnsPort) console.log(`  内置 DNS            ${lanIp}:${options.dnsPort}（上游 ${dnsServers.join(", ")}）`);
   console.log(`  下载                ${modeName}，${settings.concurrency} 条线程上限，预读 ${options.readAhead > 0 ? `${options.readAhead} 倍（最多 ${options.readAheadMax} MiB）` : "关闭"}`);
+  console.log(`  不信任证书的设备      ${options.bypassAfter > 0 ? `连续 ${options.bypassAfter} 次握手失败后放行 ${options.bypassMinutes} 分钟（不加速）` : "不放行"}`);
   console.log("  每台设备都要先安装状态页上的证书，再把流量指到代理。按 Ctrl+C 退出。");
   console.log("");
   const shutdown = () => {

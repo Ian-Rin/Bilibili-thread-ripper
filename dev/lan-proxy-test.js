@@ -99,7 +99,7 @@ test("setup", async () => {
     ca: originAuthority.certificatePem
   });
   cache = createMediaCache({ shared, upstream, log, settings: { concurrency: 16 }, readAheadMultiple: 1, sweepMs: 200, fileIdleMs: 2000 });
-  proxy = createProxyServer({ authority: proxyAuthority, cache, upstream, shared, log });
+  proxy = createProxyServer({ authority: proxyAuthority, cache, upstream, shared, log, bypassAfter: 3, bypassMs: 1500 });
   const listening = await proxy.listen({ host: "127.0.0.1", proxyPort: 0, tlsPort: 0, httpPort: 0 });
   ports = { proxy: listening.proxy.port, tls: listening.tls.port, http: listening.http.port };
   assert.ok(ports.proxy && ports.tls && ports.http);
@@ -345,6 +345,47 @@ test("a client that disconnects halfway does not break the next request", async 
   const response = await mediaRequest("upos-sz-mirrorali.bilivideo.com", `${VIDEO_PATH}${QUERY}`, "bytes=0-65535");
   assert.equal(response.status, 206);
   assert.ok(response.body.equals(fileBytes(0, 65535)));
+});
+
+test("a device that does not trust the certificate is let through after a few failed handshakes", async () => {
+  const host = "upos-sz-mirrorali.bilivideo.com";
+  // Three connections from a client that only trusts the real CDN's issuer: each handshake
+  // fails on the client side, as an Android app's would.
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const { socket, status } = await connectThroughProxy(host);
+    assert.equal(status, 200);
+    await assert.rejects(tlsOver(socket, host, [originAuthority.certificatePem]), /unable to verify|self[- ]signed|UNABLE_TO_VERIFY|SELF_SIGNED/i);
+    socket.destroy();
+  }
+  // The server sees the alerts a moment after the client gives up.
+  const deadline = Date.now() + 2000;
+  while (Date.now() < deadline && !proxy.isBypassed("127.0.0.1")) await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(proxy.isBypassed("127.0.0.1"), true, JSON.stringify(proxy.status().untrusted));
+  const listed = proxy.status().untrusted.find((item) => item.ip === "127.0.0.1");
+  assert.ok(listed?.bypassed && listed.failures >= 3, JSON.stringify(listed));
+  assert.ok(logs.some((line) => line.includes("直接放行")), "the operator is told");
+  // Now the same client reaches the real server through CONNECT: its certificate, no acceleration.
+  const { socket, status } = await connectThroughProxy(host);
+  assert.equal(status, 200);
+  const spliced = await tlsOver(socket, host, [originAuthority.certificatePem]);
+  assert.equal(spliced.authorized, true, spliced.authorizationError);
+  const hello = await requestOver(spliced, { host, path: "/hello" });
+  assert.equal(hello.body.toString(), `hello from ${host}`);
+  spliced.destroy();
+  // And through the transparent port as well.
+  const transparent = await new Promise((resolve, reject) => {
+    const client = tls.connect({ port: ports.tls, host: "127.0.0.1", servername: "upos-sz-mirrorhw.bilivideo.com", ca: [originAuthority.certificatePem] }, () => resolve(client));
+    client.once("error", reject);
+  });
+  assert.equal(transparent.authorized, true, transparent.authorizationError);
+  transparent.destroy();
+  assert.ok(proxy.stats.bypassed >= 2);
+  // The bypass runs out, and the proxy terminates TLS for this client again.
+  await new Promise((resolve) => setTimeout(resolve, 1600));
+  assert.equal(proxy.isBypassed("127.0.0.1"), false);
+  const again = await mediaRequest(host, `${VIDEO_PATH}${QUERY}`, "bytes=0-65535");
+  assert.equal(again.status, 206);
+  assert.equal(again.headers["x-btr-proxy"], "accelerated");
 });
 
 test("idle files are released", async () => {

@@ -103,6 +103,10 @@ sudo iptables -A FORWARD -i br-lan -p udp --dport 443 -j REJECT
 
 透明 TLS 端口会读 ClientHello 里的 SNI：是视频域名就自己接；不是就原样接到真正的服务器（按 SNI 域名解析），没有 SNI 的连接会被关掉。重定向全部 443 时，这台机器要扛得住全部 HTTPS 流量的转发。
 
+### 不信任证书的设备会被自动放行
+
+DNS 方式和透明代理会把所有设备的视频连接都吸过来，包括装不了证书的（安卓 App、电视）。这些设备每次 TLS 握手都失败，视频会直接打不开。所以同一设备连续 3 次握手失败（`--bypass-after`），代理就在接下来 15 分钟（`--bypass-minutes`）对它直接放行：连接原样接到真正的服务器，能看但不加速。状态页“不信任证书的设备”一栏列出它们；装好证书后等放行到期即可恢复加速。放行按客户端 IP 记，LAN 里再套一层路由器的设备会被一起放行。
+
 ## 安装证书
 
 状态页首页有每个平台的步骤和下载链接（`/ca.crt` PEM、`/ca.cer` DER）。要点：
@@ -114,13 +118,30 @@ sudo iptables -A FORWARD -i br-lan -p udp --dport 443 -j REJECT
 
 私钥在 `--ca-dir` 目录里，不要把这个目录发给别人，也不要把代理暴露到公网：持有这个 CA 的人可以对信任它的设备伪造任何网站。代理只对 B 站视频域名签证书，但 CA 本身对所有域名都有效。
 
+## 用手机上的代理工具把流量转过来
+
+能转，但要分清“把流量送到代理”和“App 信不信代理的证书”。Shadowrocket、Surge、Loon、Quantumult X、Stash、sing-box（iOS），Clash Meta for Android、NekoBox、Surfboard（Android）都能加一个 **HTTP 类型的节点**指向代理，再按域名分流；它们以 VPN 方式接管全部 TCP，播放器内核不走系统代理也能抓到（B 站 iOS 用 ijkplayer，ffmpeg 不读 Wi-Fi 代理设置）。工具自己的 MITM 不要对这些域名开，TLS 要留给代理来接。Clash 格式：
+
+```yaml
+proxies:
+  - { name: BTR-LAN, type: http, server: 192.168.1.10, port: 8080 }
+rules:
+  - DOMAIN-SUFFIX,bilivideo.com,BTR-LAN
+  - DOMAIN-SUFFIX,bilivideo.cn,BTR-LAN
+  - DOMAIN-SUFFIX,akamaized.net,BTR-LAN
+  - MATCH,DIRECT
+```
+
+- **iOS**：装证书并开启完全信任后，官方 App 大概率能用（App 对 CDN 域名没有证书绑定的话；项目作者此前用 Loon、圈 X 改写过 App 的视频请求，说明没有，但没有在本代理上实测）。能改路由器 DNS 的话连工具都不需要。
+- **Android**：流量转得过去，但官方 App 不认用户安装的证书，握手失败后被自动放行，等于没加速。这是 Android 的应用安全模型决定的，本项目不提供绕过它的办法；想在安卓上用，现实的路是第三方开源客户端：它们的网络栈是否信任用户 CA 要实测，更彻底的是把这套下载内核直接集成进客户端（README 也在征集移植）。
+
 ## 哪些设备能用、哪些不能
 
 | 设备 | 能否加速 | 说明 |
 | --- | --- | --- |
 | Windows / macOS / Linux 浏览器 | 能 | 装证书 + 代理或 DNS |
 | 手机浏览器（Safari、Chrome） | 能 | 同上 |
-| B 站 Android App | **不能** | Android 7+ 不信任用户 CA；root 后装到系统 CA 目录可以绕过，自行承担风险 |
+| B 站 Android App | **不能** | Android 7+ 的 App 不信任用户 CA，握手失败几次后被自动放行（能看，不加速） |
 | B 站 iOS App | 待实测 | iOS 允许用户信任的根证书，除非 App 做了证书绑定 |
 | 电视盒子 / 智能电视 App | 基本不能 | 一般没有安装用户 CA 的入口 |
 | 使用 http:// 地址下载视频的客户端 | 能，且不用证书 | 明文 80 端口的 Range 请求同样加速 |
