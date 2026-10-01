@@ -1,0 +1,388 @@
+"use strict";
+// The network side of the LAN proxy. Three ways in, one handler:
+//   - an ordinary HTTP proxy (CONNECT): a browser or a device with a proxy setting. A CONNECT
+//     to a CDN node is answered by the proxy itself, with a certificate for that name from
+//     the proxy's CA; any other CONNECT becomes a plain tunnel.
+//   - the TLS port of the transparent and DNS deployments: a connection arrives as if this
+//     machine were the CDN node. The server name in the client's first TLS record says which
+//     one; a name that is not a CDN node is spliced through to the real server.
+//   - a plain HTTP port for the same deployments, for clients that still use http://.
+// Inside a terminated connection every request is looked at: a bounded Range request for a
+// media file goes to the cache, which downloads it in pieces from many nodes; everything
+// else is passed through to its original host.
+const http = require("node:http");
+const https = require("node:https");
+const net = require("node:net");
+const tls = require("node:tls");
+const { LOOP_HEADER } = require("./upstream.js");
+
+// The hosts whose TLS is terminated: Bilibili's video servers. hdslb.com also carries the
+// site's static files, so only its upos- names count.
+const INTERCEPT_HOST_RE = /(?:^|\.)(?:bilivideo\.(?:com|cn|net)|akamaized\.net|szbdyd\.com|xycdn\.com|mountaintoys\.cn|nexusedgeio\.com|ahdohpiechei\.com)$/i;
+const UPOS_HDSLB_RE = /^upos-[\w-]+\.hdslb\.com$/i;
+function isInterceptHost(host) {
+  const name = String(host || "").toLowerCase().replace(/\.$/, "");
+  return INTERCEPT_HOST_RE.test(name) || UPOS_HDSLB_RE.test(name);
+}
+
+const HOP_BY_HOP = ["connection", "keep-alive", "proxy-connection", "proxy-authorization", "proxy-authenticate", "te", "trailer", "transfer-encoding", "upgrade"];
+// Headers of a passed-through answer that must not reach the client: an Alt-Svc offer of
+// HTTP/3 would move the next connections to UDP, past the proxy.
+const STRIPPED_RESPONSE = [...HOP_BY_HOP, "alt-svc"];
+// Requests with these are the player checking or validating something, not fetching media.
+const CONDITIONAL = ["if-match", "if-none-match", "if-modified-since", "if-unmodified-since", "if-range"];
+
+// Reads the server name out of a TLS ClientHello. { complete: false } while more bytes are
+// needed; { complete: true, tls: false } for something that is not TLS; otherwise the SNI
+// name or null.
+function peekClientHello(buffer) {
+  if (buffer.length < 5) return { complete: false };
+  if (buffer[0] !== 0x16 || buffer[1] !== 0x03) return { complete: true, tls: false, sni: null };
+  // The handshake message may span several records; gather their payloads.
+  const payloads = [];
+  let offset = 0;
+  let gathered = 0;
+  let needed = 4;
+  while (gathered < needed) {
+    if (offset + 5 > buffer.length) return { complete: false };
+    if (buffer[offset] !== 0x16) return { complete: true, tls: false, sni: null };
+    const length = buffer.readUInt16BE(offset + 3);
+    if (offset + 5 + length > buffer.length) return { complete: false };
+    payloads.push(buffer.subarray(offset + 5, offset + 5 + length));
+    gathered += length;
+    offset += 5 + length;
+    const head = Buffer.concat(payloads);
+    if (head.length >= 4) {
+      if (head[0] !== 0x01) return { complete: true, tls: true, sni: null };
+      needed = 4 + head.readUIntBE(1, 3);
+    }
+  }
+  const hello = Buffer.concat(payloads).subarray(0, needed);
+  try {
+    let cursor = 4 + 2 + 32;
+    cursor += 1 + hello[cursor];
+    cursor += 2 + hello.readUInt16BE(cursor);
+    cursor += 1 + hello[cursor];
+    if (cursor + 2 > hello.length) return { complete: true, tls: true, sni: null };
+    const extensionsEnd = cursor + 2 + hello.readUInt16BE(cursor);
+    cursor += 2;
+    while (cursor + 4 <= extensionsEnd && cursor + 4 <= hello.length) {
+      const type = hello.readUInt16BE(cursor);
+      const length = hello.readUInt16BE(cursor + 2);
+      cursor += 4;
+      if (type === 0) {
+        let inner = cursor + 2;
+        const listEnd = cursor + 2 + hello.readUInt16BE(cursor);
+        while (inner + 3 <= listEnd) {
+          const nameType = hello[inner];
+          const nameLength = hello.readUInt16BE(inner + 1);
+          if (nameType === 0) return { complete: true, tls: true, sni: hello.toString("ascii", inner + 3, inner + 3 + nameLength).toLowerCase() };
+          inner += 3 + nameLength;
+        }
+        return { complete: true, tls: true, sni: null };
+      }
+      cursor += length;
+    }
+  } catch (_error) {}
+  return { complete: true, tls: true, sni: null };
+}
+
+function splitHostPort(value, defaultPort) {
+  const text = String(value || "");
+  const match = /^\[?([^\]]+?)\]?(?::(\d+))?$/.exec(text);
+  if (!match) return null;
+  return { host: match[1].toLowerCase(), port: Number(match[2]) || defaultPort };
+}
+
+function contentTypeFor(url) {
+  return /\.flv$/i.test(url.pathname) ? "video/x-flv" : "video/mp4";
+}
+
+function createProxyServer(options) {
+  const { authority, cache, upstream, shared } = options;
+  const log = typeof options.log === "function" ? options.log : () => {};
+  const stats = { connections: 0, tlsIntercepted: 0, tunnels: 0, spliced: 0, accelerated: 0, passthrough: 0, fallbacks: 0, loops: 0 };
+  const contexts = new Map();
+
+  function secureContextFor(servername) {
+    const host = String(servername || "").toLowerCase();
+    let entry = contexts.get(host);
+    if (entry && entry.until > Date.now()) return entry.context;
+    const certificate = authority.serverCertificate(host);
+    const context = tls.createSecureContext({ key: certificate.key, cert: certificate.cert });
+    if (contexts.size >= 256) contexts.delete(contexts.keys().next().value);
+    contexts.set(host, { context, until: Date.now() + 6 * 3600 * 1000 });
+    return context;
+  }
+
+  const fallback = authority.serverCertificate("btr-lan-proxy.invalid");
+  const httpsServer = https.createServer({
+    key: fallback.key,
+    cert: fallback.cert,
+    ALPNProtocols: ["http/1.1"],
+    SNICallback(servername, callback) {
+      try { callback(null, secureContextFor(servername)); }
+      catch (error) { callback(error); }
+    }
+  }, (request, response) => handleRequest(request, response, "https"));
+  httpsServer.on("tlsClientError", (error, socket) => {
+    const name = socket?.servername || "";
+    // A client that does not trust the CA yet fails here; worth a line, not a stack.
+    log("debug", `TLS 握手失败${name ? `（${name}）` : ""}：${error?.message || error}`);
+  });
+  const httpServer = http.createServer((request, response) => handleRequest(request, response, "http"));
+  const proxyServer = http.createServer((request, response) => handleRequest(request, response, "proxy"));
+  proxyServer.on("connect", handleConnect);
+  const transparentServer = net.createServer(handleTransparentTls);
+  for (const server of [httpsServer, httpServer, proxyServer]) {
+    server.keepAliveTimeout = 30000;
+    server.requestTimeout = 0;
+    server.headersTimeout = 60000;
+    server.on("clientError", (error, socket) => {
+      if (error.code !== "ECONNRESET" && socket.writable) socket.end("HTTP/1.1 400 Bad Request\r\n\r\n");
+      else socket.destroy();
+    });
+  }
+
+  function absoluteUrl(request, via) {
+    const raw = String(request.url || "");
+    try {
+      if (/^https?:\/\//i.test(raw)) return new URL(raw);
+      const host = request.headers.host;
+      if (!host || raw === "*") return null;
+      const scheme = via === "https" || request.socket?.encrypted ? "https" : "http";
+      return new URL(`${scheme}://${host}${raw.startsWith("/") ? raw : `/${raw}`}`);
+    } catch (_error) {
+      return null;
+    }
+  }
+
+  function respond(response, status, text) {
+    if (response.headersSent) return response.destroy();
+    response.writeHead(status, { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" });
+    response.end(text);
+  }
+
+  function corsHeaders(request) {
+    const origin = request.headers.origin;
+    return {
+      "Access-Control-Allow-Origin": origin || "*",
+      ...(origin ? { "Access-Control-Allow-Credentials": "true" } : {}),
+      "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+      "Access-Control-Expose-Headers": "Content-Length, Content-Range, Accept-Ranges",
+      "Timing-Allow-Origin": "*"
+    };
+  }
+
+  // Bounded GET Range requests for media files are accelerated; the live site's segments
+  // are whole files and keep their own path for now, as does everything else.
+  function plan(request, url) {
+    if (request.method !== "GET") return null;
+    const range = shared.core.parseRangeHeader(request.headers.range);
+    if (!range) return null;
+    const mediaUrl = new URL(url.href);
+    mediaUrl.protocol = "https:";
+    if (!shared.core.isBilibiliMediaUrl(mediaUrl.href) || /\/live-bvc\//i.test(mediaUrl.pathname)) return null;
+    if (CONDITIONAL.some((name) => request.headers[name] !== undefined)) return null;
+    return { range, mediaUrl };
+  }
+
+  async function handleRequest(request, response, via) {
+    stats.connections += 1;
+    const url = absoluteUrl(request, via);
+    if (!url) return respond(response, 400, "这个代理需要完整的请求地址（或 Host 头）。");
+    if (request.headers[LOOP_HEADER]) {
+      stats.loops += 1;
+      log("error", `代理循环：对 ${url.host} 的请求又回到了代理自己。DNS 部署里请用 --dns-upstream 指定上游 DNS。`);
+      return respond(response, 508, "BTR LAN proxy: 代理循环，请检查上游 DNS 设置。");
+    }
+    const planned = plan(request, url);
+    if (!planned) return passthrough(request, response, url);
+    stats.accelerated += 1;
+    const controller = new AbortController();
+    response.once("close", () => {
+      if (!response.writableFinished) controller.abort(new DOMException("客户端已断开", "AbortError"));
+    });
+    const { range, mediaUrl } = planned;
+    const sink = {
+      head(total) {
+        response.writeHead(206, {
+          ...corsHeaders(request),
+          "Content-Type": contentTypeFor(mediaUrl),
+          "Content-Length": String(range.length),
+          "Content-Range": `bytes ${range.start}-${range.end}/${total}`,
+          "Accept-Ranges": "bytes",
+          "Cache-Control": "no-store",
+          "X-BTR-Proxy": "accelerated"
+        });
+      },
+      write(bytes) {
+        return new Promise((resolve, reject) => {
+          if (response.destroyed) return reject(new DOMException("客户端已断开", "AbortError"));
+          const ok = response.write(Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength));
+          if (ok) resolve();
+          else {
+            const done = () => { response.removeListener("close", closed); resolve(); };
+            const closed = () => { response.removeListener("drain", done); reject(new DOMException("客户端已断开", "AbortError")); };
+            response.once("drain", done);
+            response.once("close", closed);
+          }
+        });
+      }
+    };
+    try {
+      const result = await cache.serve({ url: mediaUrl, range, headers: request.headers, signal: controller.signal }, sink);
+      response.end();
+      log("debug", `206 ${mediaUrl.pathname.split("/").pop()} [${range.start}-${range.end}] ${result.pieces} 段${result.fromCache ? `，预读命中 ${Math.round(result.fromCache / 1024)} KiB` : ""}`);
+    } catch (error) {
+      if (error?.name === "AbortError" || controller.signal.aborted) return response.destroy();
+      if (!error?.headed && !response.headersSent) {
+        stats.fallbacks += 1;
+        log("warn", `加速失败，交回原始连接：${mediaUrl.pathname.split("/").pop()} [${range.start}-${range.end}]：${error?.message || error}`);
+        return passthrough(request, response, url);
+      }
+      log("warn", `传输中断：${error?.message || error}`);
+      response.destroy();
+    }
+  }
+
+  function passthrough(request, response, url) {
+    stats.passthrough += 1;
+    const headers = { ...request.headers };
+    for (const name of HOP_BY_HOP) delete headers[name];
+    headers.host = url.host;
+    headers[LOOP_HEADER] = "1";
+    let outgoing;
+    try { outgoing = upstream.rawRequest(url, request.method, headers); }
+    catch (error) { return respond(response, 502, `无法转发：${error.message}`); }
+    const stop = () => { if (!response.writableFinished) outgoing.destroy(); };
+    response.once("close", stop);
+    outgoing.once("response", (incoming) => {
+      const outHeaders = { ...incoming.headers };
+      for (const name of STRIPPED_RESPONSE) delete outHeaders[name];
+      if (response.destroyed) return incoming.destroy();
+      response.writeHead(incoming.statusCode, incoming.statusMessage, outHeaders);
+      incoming.pipe(response);
+      incoming.once("error", () => response.destroy());
+    });
+    outgoing.once("error", (error) => {
+      if (!response.headersSent) respond(response, 502, `上游请求失败：${error.message}`);
+      else response.destroy();
+    });
+    request.pipe(outgoing);
+  }
+
+  // A socket that already belongs to the client, now served as a TLS connection of our own.
+  function adopt(socket, head) {
+    socket.removeAllListeners("data");
+    socket.pause();
+    if (head?.length) socket.unshift(head);
+    httpsServer.emit("connection", socket);
+  }
+
+  function tunnel(client, server) {
+    client.pipe(server);
+    server.pipe(client);
+    const close = () => { client.destroy(); server.destroy(); };
+    client.once("error", close);
+    server.once("error", close);
+    client.once("close", close);
+    server.once("close", close);
+  }
+
+  function handleConnect(request, socket, head) {
+    socket.on("error", () => {});
+    const target = splitHostPort(request.url, 443);
+    if (!target) return socket.end("HTTP/1.1 400 Bad Request\r\n\r\n");
+    if (target.port === 443 && isInterceptHost(target.host)) {
+      stats.tlsIntercepted += 1;
+      socket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+      return adopt(socket, head);
+    }
+    stats.tunnels += 1;
+    upstream.connect(target.host, target.port).then((server) => {
+      if (socket.destroyed) return server.destroy();
+      socket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+      if (head?.length) server.write(head);
+      tunnel(socket, server);
+    }, (error) => {
+      socket.end(`HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n无法连接 ${target.host}:${target.port}：${error.message}`);
+    });
+  }
+
+  // The transparent TLS port: the first bytes decide where the connection goes.
+  function handleTransparentTls(socket) {
+    socket.on("error", () => {});
+    const chunks = [];
+    let length = 0;
+    const timer = setTimeout(() => socket.destroy(), 8000);
+    const onData = (chunk) => {
+      chunks.push(chunk);
+      length += chunk.length;
+      const buffer = Buffer.concat(chunks);
+      const peek = peekClientHello(buffer);
+      if (!peek.complete) {
+        if (length > 65536) socket.destroy();
+        return;
+      }
+      clearTimeout(timer);
+      socket.removeListener("data", onData);
+      socket.pause();
+      socket.unshift(buffer);
+      if (!peek.tls) {
+        log("debug", "TLS 端口收到的不是 TLS 连接，已关闭");
+        return socket.destroy();
+      }
+      if (peek.sni && isInterceptHost(peek.sni)) {
+        stats.tlsIntercepted += 1;
+        return httpsServer.emit("connection", socket);
+      }
+      if (!peek.sni) {
+        log("debug", "TLS 连接没有带服务器名，无法知道要转发到哪里");
+        return socket.destroy();
+      }
+      stats.spliced += 1;
+      upstream.connect(peek.sni, 443).then((server) => {
+        if (socket.destroyed) return server.destroy();
+        tunnel(socket, server);
+      }, () => socket.destroy());
+    };
+    socket.on("data", onData);
+  }
+
+  function listenOn(server, port, host) {
+    return new Promise((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(port, host, () => {
+        server.removeListener("error", reject);
+        resolve(server.address());
+      });
+    });
+  }
+
+  const listening = {};
+  return Object.freeze({
+    stats,
+    listening,
+    httpsServer,
+    isInterceptHost,
+    // A port of null stays closed; 0 takes any free port.
+    async listen({ host = "0.0.0.0", proxyPort = null, tlsPort = null, httpPort = null } = {}) {
+      if (proxyPort != null) listening.proxy = await listenOn(proxyServer, proxyPort, host);
+      if (tlsPort != null) listening.tls = await listenOn(transparentServer, tlsPort, host);
+      if (httpPort != null) listening.http = await listenOn(httpServer, httpPort, host);
+      return listening;
+    },
+    status() {
+      return { ...stats, listening: { ...listening } };
+    },
+    close() {
+      for (const server of [proxyServer, transparentServer, httpServer, httpsServer]) {
+        try { server.close(); } catch (_error) {}
+        try { server.closeAllConnections?.(); } catch (_error) {}
+      }
+    }
+  });
+}
+
+module.exports = { createProxyServer, isInterceptHost, peekClientHello, splitHostPort };

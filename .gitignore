@@ -15,3 +15,6 @@ Thumbs.db
 Desktop.ini
 *.log
 
+
+# 局域网代理生成的证书和私钥
+proxy/ca/

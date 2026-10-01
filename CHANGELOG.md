@@ -4,6 +4,11 @@
 
 ## [Unreleased]
 
+### 新增
+
+- 局域网代理（实验，`proxy/`）：把 `range-core`、`cdn-resolver`、`idm-downloader` 这套下载内核跑在局域网里的一台机器上，同一网络的浏览器不装脚本也能多线程、多 CDN 下载 B 站视频。代理用自己生成的 CA 给 `*.bilivideo.com` 等视频域名签证书接下 TLS（每台设备要装一次根证书），只接管 B 站媒体文件的有界 Range 请求，边下边回写，并把后面的数据预读到内存；其他请求和域名原样转发。提供三种入口：HTTP 代理（CONNECT）、按 SNI 分流的透明 TLS 端口和明文 HTTP 端口，另带一个只对视频域名“指路”的内置 DNS，以及状态页（证书下载、线程和节点状态）。被动扫描 HTTPS 流量做不到加速，B 站安卓 App 不信任用户证书也加速不了，这些都写在 `proxy/README.md`。
+- 测试：`dev/x509-test.js`（证书生成与 TLS 握手）和 `dev/lan-proxy-test.js`（本机假 CDN 上的代理端到端），已加入 `npm test`。
+
 ## [2026.9.29.2] - 2026-09-29
 
 ### 新增
