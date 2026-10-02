@@ -174,6 +174,8 @@ test("intercept decision: Bilibili media hosts, nothing else", () => {
   assert.equal(isInterceptHost("xy1x2x3x4xy.mcdn.bilivideo.cn"), true);
   assert.equal(isInterceptHost("upos-sz-mirrorali.hdslb.com"), true);
   assert.equal(isInterceptHost("i0.hdslb.com"), false, "static files keep their own TLS");
+  assert.equal(isInterceptHost("dash.akamaized.net"), false, "other companies' Akamai hosts are not touched");
+  assert.equal(isInterceptHost("cdn.xycdn.com"), false, "third-party PCDN providers serve other apps too");
   assert.equal(isInterceptHost("api.bilibili.com"), false, "the site itself is never touched");
   assert.equal(isInterceptHost("www.bilibili.com"), false);
   assert.equal(isInterceptHost("example.com"), false);

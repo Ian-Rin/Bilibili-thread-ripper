@@ -16,13 +16,18 @@ const net = require("node:net");
 const tls = require("node:tls");
 const { LOOP_HEADER } = require("./upstream.js");
 
-// The hosts whose TLS is terminated: Bilibili's video servers. hdslb.com also carries the
-// site's static files, so only its upos- names count.
-const INTERCEPT_HOST_RE = /(?:^|\.)(?:bilivideo\.(?:com|cn|net)|akamaized\.net|szbdyd\.com|xycdn\.com|mountaintoys\.cn|nexusedgeio\.com|ahdohpiechei\.com)$/i;
-const UPOS_HDSLB_RE = /^upos-[\w-]+\.hdslb\.com$/i;
+// The hosts whose TLS is terminated: Bilibili's own video servers (bilivideo.*), and its
+// upos- names on Akamai and hdslb.com. In the transparent and DNS deployments every
+// connection of a device may come here and the server name alone decides, so shared CDN
+// domains (akamaized.net serves many companies, hdslb.com carries the site's static files)
+// are matched only on Bilibili's upos- hosts, and the third-party PCDN provider domains the
+// userscript knows (szbdyd.com, xycdn.com, ...) are left alone: other apps use them too, and a
+// player only falls back to them.
+const INTERCEPT_HOST_RE = /(?:^|\.)bilivideo\.(?:com|cn|net)$/i;
+const UPOS_SHARED_RE = /^upos-[\w-]+\.(?:akamaized\.net|hdslb\.com)$/i;
 function isInterceptHost(host) {
   const name = String(host || "").toLowerCase().replace(/\.$/, "");
-  return INTERCEPT_HOST_RE.test(name) || UPOS_HDSLB_RE.test(name);
+  return INTERCEPT_HOST_RE.test(name) || UPOS_SHARED_RE.test(name);
 }
 
 const HOP_BY_HOP = ["connection", "keep-alive", "proxy-connection", "proxy-authorization", "proxy-authenticate", "te", "trailer", "transfer-encoding", "upgrade"];
