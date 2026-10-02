@@ -54,7 +54,9 @@ ol li,ul li{margin:4px 0}
 <h2>CDN 节点</h2>
 <table><thead><tr><th>节点</th><th>状态</th><th>速度</th></tr></thead><tbody id="nodes"></tbody></table>
 <h2>正在下载的文件</h2>
-<table><thead><tr><th>文件</th><th>类型</th><th>大小</th><th>请求数</th><th>缓存片段</th></tr></thead><tbody id="files"></tbody></table>
+<table><thead><tr><th>文件</th><th>类型</th><th>大小</th><th>索引</th><th>播放位置（估）</th><th>请求数</th><th>缓存片段</th></tr></thead><tbody id="files"></tbody></table>
+<h2>直播</h2>
+<table><thead><tr><th>直播流</th><th>已缓存分片</th><th>最新分片号</th><th>节点</th></tr></thead><tbody id="streams"></tbody></table>
 <h2>不信任证书的设备</h2>
 <p class="muted">这些设备连接 B 站视频服务器时 TLS 握手失败，多半是没装证书（安卓 App 不认用户证书）。连续失败几次后代理会自动放行它们一段时间：能看，但不加速。在设备上装好证书后等放行到期即可。</p>
 <table><thead><tr><th>设备</th><th>状态</th><th>失败次数</th><th>最近错误</th></tr></thead><tbody id="untrusted"></tbody></table>
@@ -69,10 +71,12 @@ async function tick(){
     document.getElementById("tiles").innerHTML=[
       ["当前线程",c.activeThreads],["总速度",fmt(c.totalSpeedBps)+"/s"],["加速请求",p.accelerated],["预读命中",c.aheadHits],
       ["已加速数据",fmt(c.servedBytes)],["内存缓存",fmt(c.cacheBytes)],["直接转发",p.passthrough],["交回原连接",p.fallbacks],
-      ["TLS 接管连接",p.tlsIntercepted],["普通隧道",p.tunnels+p.spliced],["放行的连接",p.bypassed],["CDN 模式",c.settings.mode==="overseas"?"海外":c.settings.mode==="custom"?"自定义":"大陆"],["线程上限",c.settings.concurrency]
+      ["TLS 接管连接",p.tlsIntercepted],["普通隧道",p.tunnels+p.spliced],["放行的连接",p.bypassed],["CDN 模式",c.settings.mode==="overseas"?"海外":c.settings.mode==="custom"?"自定义":"大陆"],["线程上限",c.settings.concurrency],
+      ["直播分片",s.live?s.live.segments:"关"],["直播预取命中",s.live?s.live.segmentHits:"关"]
     ].map(([k,v])=>'<div class="tile"><span class="muted">'+k+'</span><b>'+esc(v)+'</b></div>').join("");
     document.getElementById("nodes").innerHTML=(c.nodes||[]).map((n)=>'<tr><td>'+esc(n.host)+'</td><td class="'+(n.state==="healthy"?"ok":n.state==="untested"?"muted":"bad")+'">'+esc({healthy:"正常",untested:"未测",blocked:"暂停",banned:"停用"}[n.state]||n.state)+'</td><td>'+(n.bps?fmt(n.bps)+"/s":"")+'</td></tr>').join("")||'<tr><td colspan=3 class="muted">还没有下载</td></tr>';
-    document.getElementById("files").innerHTML=(c.files||[]).map((f)=>'<tr><td><code>'+esc(f.path.split("/").pop())+'</code></td><td>'+(f.kind==="audio"?"声音":"画面")+'</td><td>'+(f.total?fmt(f.total):"")+'</td><td>'+f.requests+'</td><td>'+f.pieces.length+'（'+fmt(f.pieces.reduce((a,b)=>a+b.received,0))+'）</td></tr>').join("")||'<tr><td colspan=5 class="muted">没有正在播放的视频</td></tr>';
+    document.getElementById("files").innerHTML=(c.files||[]).map((f)=>'<tr><td><code>'+esc(f.path.split("/").pop())+'</code></td><td>'+(f.kind==="audio"?"声音":"画面")+'</td><td>'+(f.total?fmt(f.total):"")+'</td><td>'+(f.segments?f.segments+" 段":'<span class="muted">无</span>')+'</td><td>'+(f.playhead==null?'<span class="muted">未知</span>':f.playhead.toFixed(1)+" s"+(f.requestedAhead!=null?'，已请求到 +'+f.requestedAhead.toFixed(0)+' s':""))+'</td><td>'+f.requests+'</td><td>'+f.pieces.length+'（'+fmt(f.pieces.reduce((a,b)=>a+b.received,0))+'）</td></tr>').join("")||'<tr><td colspan=7 class="muted">没有正在播放的视频</td></tr>';
+    const l=s.live; document.getElementById("streams").innerHTML=l?((l.streams||[]).map((st)=>'<tr><td><code>'+esc(st.key)+'</code></td><td>'+st.cached+'</td><td>'+st.lastNum+'</td><td>'+st.hosts.map((h)=>'<span class="'+(h.state==="healthy"?"ok":h.state==="untested"?"muted":"bad")+'">'+esc(h.host.split(".")[0])+'</span>').join(" · ")+'</td></tr>').join("")||'<tr><td colspan=4 class="muted">没有正在看的直播</td></tr>'):'<tr><td colspan=4 class="muted">直播加速已关闭</td></tr>';
     document.getElementById("untrusted").innerHTML=(p.untrusted||[]).map((u)=>'<tr><td><code>'+esc(u.ip)+'</code></td><td class="'+(u.bypassed?"bad":"muted")+'">'+(u.bypassed?"已放行，还剩 "+Math.ceil(u.bypassForMs/60000)+" 分钟":"握手失败中")+'</td><td>'+u.failures+'</td><td class="muted">'+esc(u.lastError||"")+'</td></tr>').join("")||'<tr><td colspan=4 class="muted">没有</td></tr>';
   }catch(e){}
 }

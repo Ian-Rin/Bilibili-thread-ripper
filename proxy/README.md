@@ -9,7 +9,7 @@
 | 能不能“在局域网里直接扫描 B 站流量”来加速？ | **被动扫描不行**。视频数据走 HTTPS，网关看得到的只有目标 IP、SNI 域名和流量大小，看不到也改不了里面的 Range 请求。要加速必须让设备把 TLS 连接交给代理（代理用自己的 CA 给 `*.bilivideo.com` 签证书），这就要求**每台设备安装一次代理的根证书**。 |
 | 能自动生效吗？ | 装好证书以后可以：路由器把 DNS 指到这台机器（或者这台机器就是网关做透明代理），设备什么都不用设。只是证书这一步绕不开。 |
 | 能加速哪些设备？ | 电脑和手机上的**浏览器**（Chrome、Edge、Firefox、Safari）可以。**B 站安卓 App 不行**：Android 7 起 App 默认不信任用户安装的 CA，除非 root 后把证书装进系统目录。iOS App、电视盒子 App 要实测，可能有证书绑定。 |
-| 效果和油猴脚本比？ | 下载内核相同（同一份 `range-core / cdn-resolver / idm-downloader`），多了预读（提前下好下一段）。少了脚本里“离播放还有多久”的截止时间信息和缓冲区感知，所以线程调度不如全接管模式精细，更接近兼容模式。 |
+| 效果和油猴脚本比？ | 下载内核相同（同一份 `range-core / cdn-resolver / idm-downloader`）。代理从播放器自己请求的索引（SIDX）里读出每段的播放时间，推算播放位置，给每个下载和全接管模式一样的截止时间，并按播放时间提前预读 20 秒。拿不回的是播放器那一半：起播缓冲、配额、清晰度跟随仍由 B 站播放器负责。直播分片做多节点竞速和预取，但页面内的 WebRTC P2P 代理管不到。 |
 
 下面是原理、部署方式、限制和开发说明。
 
@@ -45,9 +45,9 @@ BTR 局域网代理（这台机器）
 ```
 
 - `proxy/shared-core.js` 直接加载 `src/` 里的三个内核文件，没有复制一份；仓库里改了内核，代理跟着变。
-- `proxy/media-cache.js` 是脚本“兼容模式”的服务器端翻版：每个文件一组“片段”，请求用已有片段覆盖、缺口新开下载、下一段提前下载；拖动进度条时丢掉旧位置的预读；文件 90 秒没人要就释放。
+- `proxy/media-cache.js` 是脚本“兼容模式”的服务器端翻版，再加上全接管模式的调度信号：每个文件一组“片段”，请求用已有片段覆盖、缺口新开下载；播放器一开始请求的索引（SIDX）经过时就被解析，之后代理知道每个请求是第几段、这一段在第几秒。拖动后的第一个请求落在播放位置上，从那一刻起按一倍速推算播放头，每个下载（包括预读）都带一个“播放还有几秒需要它”的截止时间，内核据此开备份副本、排优先级，和全接管模式一样。预读按分段边界进行，默认提前 20 秒、同时最多 2 段在下，缓存快满时停下。没有索引的文件（FLV）退回按请求长度的 2 倍预读、不带截止时间。拖动进度条时丢掉旧位置的预读；文件 90 秒没人要就释放。暂停时估算会偏前，只会让副本开得略早。
+- `proxy/live-cache.js` 是脚本直播模块（`live-hook.js`）的服务器端翻版：m3u8 列表原样回给播放器，但代理顺手解析它，把宣告的分片和初始化段提前从多个 fMP4 节点竞速下载（慢 0.4 秒开备份，两次零字节的节点整场停用），再投机预取下一个还没出现的分片；播放器来取时直接给。PCDN 中转（`*.mcdn.bilivideo.cn:4483`）和 smtcdns 中转地址改回官方节点。页面里的 WebRTC P2P SDK 是浏览器内对象，代理屏蔽不了，这是和脚本版的差距。
 - `proxy/server.js` 提供三种入口（见下），`proxy/x509.js` 不依赖任何库生成 CA 和证书（RSA 2048、SHA-256，带 SAN，满足 iOS / Android / Chrome 对本地根证书的要求），`proxy/dns.js` 是一个很小的 DNS 服务器，只对 B 站视频域名“指路”。
-- 直播（`live.bilibili.com` 的 fMP4 分片）目前原样转发，没有加速；可以之后把 `live-core.js` 的节点池搬过来。
 
 ## 运行
 
@@ -70,7 +70,9 @@ node proxy/index.js --help          # 所有选项
 | `--dns-upstream` | `223.5.5.5,119.29.29.29` | 代理自己和内置 DNS 使用的上游 DNS。**DNS 方式必须设对**，否则代理会把 CDN 域名解析到自己（会检测并返回 508） |
 | `--mode` / `--hosts` | `mainland` | 和脚本一样：`mainland` / `overseas` / `custom` |
 | `--threads` | 16 | 并发上限 4/8/16/32/64/128（没有自动模式：代理看不到播放器卡不卡） |
-| `--read-ahead` / `--read-ahead-max` | 2 / 32 | 预读请求长度的几倍，最多多少 MiB；0 关闭预读 |
+| `--read-ahead-seconds` | 20 | 读到索引后按播放时间预读多少秒 |
+| `--read-ahead` / `--read-ahead-max` | 2 / 64 | 没有索引时预读请求长度的几倍；预读总上限 MiB；`--read-ahead 0` 关闭全部预读 |
+| `--live` | on | 直播加速，`off` 则直播原样转发 |
 | `--cache` | 512 | 内存缓存上限（MiB） |
 | `--ca-dir` | `proxy/ca` | CA 私钥和证书的目录（已在 `.gitignore` 里） |
 
@@ -97,6 +99,8 @@ sudo node proxy/index.js --tls-port 8443 --http-port 8080 --proxy-port 0
 # 只把去往 B 站视频节点的 443 流量重定向过来（建议用 ipset 维护目标 IP 集合，或者偷懒重定向全部 443）：
 sudo iptables -t nat -A PREROUTING -i br-lan -p tcp --dport 443 -j REDIRECT --to-ports 8443
 sudo iptables -t nat -A PREROUTING -i br-lan -p tcp --dport 80  -j REDIRECT --to-ports 8080
+# 直播的 PCDN 中转走 4483 端口，也可以一并接管（HTTP 代理模式下自动处理，不用这一行）：
+sudo iptables -t nat -A PREROUTING -i br-lan -p tcp --dport 4483 -j REDIRECT --to-ports 8443
 # 阻止 QUIC 绕过（可选）：
 sudo iptables -A FORWARD -i br-lan -p udp --dport 443 -j REJECT
 ```
@@ -148,8 +152,8 @@ rules:
 
 ## 已知限制
 
-- **直播不加速**：live.bilibili.com 的分片原样转发。
-- **没有播放截止时间**：脚本的全接管模式知道每一段离播放还有几秒，据此决定什么时候开备份副本；代理只知道请求顺序，调度退回到兼容模式的策略，另加预读补偿。
+- **直播少了 P2P 屏蔽**：分片竞速和预取都有，但浏览器里的 WebRTC P2P 拉取代理管不到，海外观众少时它造成的卡顿还在。App 的 PCDN 是 HTTP 中转，代理能改回官方节点。
+- **截止时间是推算的**：按拖动后第一个请求的位置和一倍速推算播放头。暂停、卡顿时估算偏前，备份副本会开得略早，多费一点流量；倍速播放时估算偏后，对冲略晚。FLV 和没有请求索引的播放器拿不到截止时间。
 - **签名过期由播放器负责**：地址的 `deadline` 过了，B 站播放器自己会重新请求 `playurl`，代理只会用它给的新地址（同一文件的测速结果会保留）。
 - **HTTP/3**：DNS 方式对 HTTPS 类型查询回答空，转发的响应里去掉了 `Alt-Svc`，但如果设备已经缓存了 QUIC 可用的信息，第一次可能绕过代理；透明代理建议顺手拦掉 UDP 443。
 - **性能**：Node 单线程做 TLS 加解密和拼接，还没有实测数字；x86 小主机应该没问题，ARM 小板子多路 4K 时可能是瓶颈。
@@ -158,9 +162,10 @@ rules:
 ## 开发
 
 ```bash
-node dev/x509-test.js        # 证书：DER 编码、签发、TLS 握手
-node dev/lan-proxy-test.js   # 代理端到端：本机假 CDN，CONNECT / 透明 TLS / 明文 HTTP / 预读 / 回退 / DNS
-npm test                     # 上面两项已加入 dev/run-tests.js
+node dev/x509-test.js              # 证书：DER 编码、签发、TLS 握手
+node dev/lan-proxy-test.js         # 代理端到端：本机假 CDN，CONNECT / 透明 TLS / 明文 HTTP / 预读 / 回退 / 放行 / DNS
+node dev/lan-proxy-media-test.js   # 带真实 SIDX 的文件：索引解析、播放头、按分段预读、拖动；直播：列表、预取、竞速、中转改写
+npm test                           # 上面三项已加入 dev/run-tests.js
 ```
 
 文件：
@@ -168,7 +173,8 @@ npm test                     # 上面两项已加入 dev/run-tests.js
 ```text
 proxy/index.js        命令行入口、参数、启动横幅
 proxy/server.js       HTTP 代理（CONNECT）、透明 TLS 端口（SNI 探测）、明文 HTTP 端口、请求分流、原样转发
-proxy/media-cache.js  文件片段缓存、按请求覆盖、预读、拖动时的清理、释放
+proxy/media-cache.js  文件片段缓存、按请求覆盖、索引与播放头推算、带截止时间的下载、按分段预读、拖动时的清理、释放
+proxy/live-cache.js   直播：列表解析、分片多节点竞速、预取、中转地址改写
 proxy/upstream.js     出站：Range 子请求（给内核用的 fetch）、原样转发、隧道；自己的上游 DNS
 proxy/shared-core.js  加载 src/ 里的内核
 proxy/x509.js         CA 和服务器证书
@@ -178,7 +184,7 @@ proxy/admin.js        状态页、证书下载、/stats.json
 
 后续可以做的事（按价值排序）：
 
-1. 直播：把 `live-core.js` 的节点池和分片预取搬到代理里。
-2. 用请求间隔推算播放速度，给内核一个近似的截止时间，让备份副本的时机更接近全接管模式。
-3. 解析 `sidx`，按真实分段边界预读，而不是按上一个请求的长度。
+1. 在真实网络上验证截止时间推算和预读深度的取值（20 秒、2 段在下）。
+2. 用请求间隔推算播放倍速，修正播放头估算。
+3. 自动线程数：用估算的缓冲量代替播放器的卡顿信号。
 4. 状态页上改设置（CDN 模式、线程数）而不是只能重启。

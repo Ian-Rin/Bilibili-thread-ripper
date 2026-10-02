@@ -105,8 +105,10 @@ function clientIp(socket) {
 
 function createProxyServer(options) {
   const { authority, cache, upstream, shared } = options;
+  // The live module (proxy/live-cache.js); null leaves live streams passed through.
+  const live = options.live || null;
   const log = typeof options.log === "function" ? options.log : () => {};
-  const stats = { connections: 0, tlsIntercepted: 0, tunnels: 0, spliced: 0, accelerated: 0, passthrough: 0, fallbacks: 0, loops: 0, bypassed: 0 };
+  const stats = { connections: 0, tlsIntercepted: 0, tunnels: 0, spliced: 0, accelerated: 0, passthrough: 0, fallbacks: 0, loops: 0, bypassed: 0, livePlaylists: 0, liveSegments: 0 };
   const contexts = new Map();
 
   // Devices that do not trust the proxy's certificate (an Android app, a TV) fail the TLS
@@ -221,16 +223,24 @@ function createProxyServer(options) {
     };
   }
 
-  // Bounded GET Range requests for media files are accelerated; the live site's segments
-  // are whole files and keep their own path for now, as does everything else.
+  // What to do with a request. Bounded GET Range requests for media files go to the media
+  // cache. Live playlists and whole live segments go to the live module, and any other
+  // address of a P2P or commercial relay is passed through to the official node instead.
+  // Everything else is passed through as it is.
   function plan(request, url) {
     if (request.method !== "GET") return null;
-    const range = shared.core.parseRangeHeader(request.headers.range);
-    if (!range) return null;
     const mediaUrl = new URL(url.href);
     mediaUrl.protocol = "https:";
-    if (!shared.core.isBilibiliMediaUrl(mediaUrl.href) || /\/live-bvc\//i.test(mediaUrl.pathname)) return null;
     if (CONDITIONAL.some((name) => request.headers[name] !== undefined)) return null;
+    const range = shared.core.parseRangeHeader(request.headers.range);
+    if (live) {
+      if (live.isPlaylistUrl(mediaUrl.href)) return { live: "playlist", mediaUrl };
+      if (live.isSegmentUrl(mediaUrl.href) && !request.headers.range) return { live: "segment", mediaUrl };
+      const rewritten = live.rewriteUrl(mediaUrl.href);
+      if (rewritten !== mediaUrl.href) return { passthroughTo: new URL(rewritten) };
+    }
+    if (!range) return null;
+    if (!shared.core.isBilibiliMediaUrl(mediaUrl.href) || /\/live-bvc\//i.test(mediaUrl.pathname)) return null;
     return { range, mediaUrl };
   }
 
@@ -245,11 +255,13 @@ function createProxyServer(options) {
     }
     const planned = plan(request, url);
     if (!planned) return passthrough(request, response, url);
-    stats.accelerated += 1;
+    if (planned.passthroughTo) return passthrough(request, response, planned.passthroughTo);
     const controller = new AbortController();
     response.once("close", () => {
       if (!response.writableFinished) controller.abort(new DOMException("客户端已断开", "AbortError"));
     });
+    if (planned.live) return handleLive(request, response, planned, controller);
+    stats.accelerated += 1;
     const { range, mediaUrl } = planned;
     const sink = {
       head(total) {
@@ -290,6 +302,47 @@ function createProxyServer(options) {
       }
       log("warn", `传输中断：${error?.message || error}`);
       response.destroy();
+    }
+  }
+
+  // A live playlist is fetched and handed back whole (the module reads it on the way); a
+  // live segment comes from the module's cache or its node race. Either failing falls back
+  // to the plain passthrough, to the official node.
+  async function handleLive(request, response, planned, controller) {
+    const { mediaUrl } = planned;
+    const target = new URL(live.rewriteUrl(mediaUrl.href));
+    try {
+      if (planned.live === "playlist") {
+        stats.livePlaylists += 1;
+        const result = await live.fetchPlaylist(mediaUrl.href, request.headers, controller.signal);
+        if (controller.signal.aborted) return response.destroy();
+        const headers = { ...corsHeaders(request), "Cache-Control": "no-store", "X-BTR-Proxy": "live-playlist" };
+        for (const name of ["content-type", "last-modified", "etag", "date"]) {
+          const value = result.headers.get(name);
+          if (value) headers[name] = value;
+        }
+        headers["Content-Length"] = String(Buffer.byteLength(result.text));
+        response.writeHead(result.status, headers);
+        return response.end(result.text);
+      }
+      stats.liveSegments += 1;
+      const result = await live.fetchSegment(mediaUrl.href, request.headers, controller.signal);
+      if (controller.signal.aborted) return response.destroy();
+      response.writeHead(200, {
+        ...corsHeaders(request),
+        "Content-Type": result.contentType,
+        "Content-Length": String(result.bytes.byteLength),
+        "Cache-Control": "no-store",
+        "X-BTR-Proxy": result.fromCache ? "live-prefetched" : "live"
+      });
+      response.end(Buffer.from(result.bytes.buffer, result.bytes.byteOffset, result.bytes.byteLength));
+      log("debug", `直播分片 ${mediaUrl.pathname.split("/").pop()} ${result.fromCache ? "预取命中" : `来自 ${result.host}`}`);
+    } catch (error) {
+      if (error?.name === "AbortError" || controller.signal.aborted) return response.destroy();
+      if (response.headersSent) return response.destroy();
+      stats.fallbacks += 1;
+      log("warn", `直播${planned.live === "playlist" ? "列表" : "分片"}处理失败，交回原始连接：${error?.message || error}`);
+      passthrough(request, response, target);
     }
   }
 
@@ -360,7 +413,9 @@ function createProxyServer(options) {
     socket.on("error", () => {});
     const target = splitHostPort(request.url, 443);
     if (!target) return socket.end("HTTP/1.1 400 Bad Request\r\n\r\n");
-    if (target.port === 443 && isInterceptHost(target.host)) {
+    // 4483 is the port of the PCDN relays (xxx.mcdn.bilivideo.cn), whose addresses the live
+    // module turns back into official nodes.
+    if ((target.port === 443 || (live && target.port === 4483)) && isInterceptHost(target.host)) {
       if (isBypassed(clientIp(socket))) stats.bypassed += 1;
       else {
         stats.tlsIntercepted += 1;
