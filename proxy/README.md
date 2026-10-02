@@ -65,7 +65,7 @@ node proxy/index.js --help          # 所有选项
 | 选项 | 默认 | 说明 |
 | --- | --- | --- |
 | `--proxy-port` | 8080 | HTTP 代理端口（CONNECT），0 关闭 |
-| `--tls-port` / `--http-port` | 0 / 0 | DNS 方式和透明代理用的 443 / 80 |
+| `--tls-port` / `--http-port` | 无 / 0 | DNS 方式和透明代理用的 TLS 端口（可多个，如 `443,4483`）和明文 80 |
 | `--dns-port` | 0 | 内置 DNS，通常 53；配合 `--lan-ip` |
 | `--dns-upstream` | `223.5.5.5,119.29.29.29` | 代理自己和内置 DNS 使用的上游 DNS。**DNS 方式必须设对**，否则代理会把 CDN 域名解析到自己（会检测并返回 508） |
 | `--mode` / `--hosts` | `mainland` | 和脚本一样：`mainland` / `overseas` / `custom` |
@@ -85,10 +85,10 @@ node proxy/index.js --help          # 所有选项
 ### B. DNS 方式（全家自动生效）
 
 ```bash
-sudo node proxy/index.js --dns-port 53 --tls-port 443 --http-port 80 --lan-ip 192.168.1.10 --dns-upstream 223.5.5.5
+sudo node proxy/index.js --dns-port 53 --tls-port 443,4483 --http-port 80 --lan-ip 192.168.1.10 --dns-upstream 223.5.5.5
 ```
 
-然后把路由器 DHCP 下发的 DNS 改成 `192.168.1.10`。内置 DNS 对 `*.bilivideo.com`、`*.akamaized.net` 等视频域名回答这台机器的 IP，对 AAAA 和 HTTPS 类型回答空（防止设备走 IPv6 或 HTTP/3 绕过去），其他域名原样转发到上游。设备连到 443 时 SNI 还是原来的域名，代理据此签证书和转发。
+然后把路由器 DHCP 下发的 DNS 改成 `192.168.1.10`。`--tls-port` 里的 4483 是 App 的 PCDN 中转端口（`*.mcdn.bilivideo.cn`），这些域名也会被指到代理，直播模块把它们改回官方节点。只想让一台手机试：路由器不动，手机 Wi-Fi 的 DNS 手动填这台机器的 IP 即可，这也是测官方 App 的办法（App 的播放器可能不走 Wi-Fi 代理设置，DNS 它躲不开）。上游 DNS 填路由器地址或离你近的公共 DNS，手机每次解析都要绕一次，远的上游会拖慢所有网页。内置 DNS 对 `*.bilivideo.com`、`*.akamaized.net` 等视频域名回答这台机器的 IP，对 AAAA 和 HTTPS 类型回答空（防止设备走 IPv6 或 HTTP/3 绕过去），其他域名原样转发到上游。设备连到 443 时 SNI 还是原来的域名，代理据此签证书和转发。
 
 注意：开了“安全 DNS / Private DNS / DoH”的设备不会问路由器的 DNS，这种方式对它们无效；关掉或者改用方式 A / C。
 

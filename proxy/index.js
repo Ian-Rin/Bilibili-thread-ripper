@@ -3,7 +3,7 @@
 // 线程撕裂者 局域网代理：node proxy/index.js [选项]
 //
 //   --proxy-port 8080      HTTP 代理端口（CONNECT），0 关闭
-//   --tls-port 0           透明代理 / DNS 方式用的 TLS 端口（通常 443）
+//   --tls-port 0           透明代理 / DNS 方式用的 TLS 端口，可以多个：443,4483（4483 是 App 的 PCDN 中转）
 //   --http-port 0          透明代理 / DNS 方式用的明文 HTTP 端口（通常 80）
 //   --dns-port 0           内置 DNS 端口（通常 53）；开启后把路由器的 DNS 指向本机
 //   --admin-port 8081      状态页和证书下载
@@ -35,7 +35,7 @@ const { createDnsServer } = require("./dns.js");
 
 function parseArgs(argv) {
   const options = {
-    proxyPort: 8080, tlsPort: 0, httpPort: 0, dnsPort: 0, adminPort: 8081,
+    proxyPort: 8080, tlsPort: [], httpPort: 0, dnsPort: 0, adminPort: 8081,
     lanIp: "auto", dnsUpstream: "223.5.5.5,119.29.29.29",
     mode: "mainland", hosts: "", threads: 16, readAhead: 2, readAheadSeconds: 20, readAheadMax: 64, cache: 512, bypassAfter: 3, bypassMinutes: 15, live: "on",
     caDir: path.resolve(__dirname, "ca"), listen: "0.0.0.0", verbose: false, help: false
@@ -50,7 +50,8 @@ function parseArgs(argv) {
     const value = match[2] !== undefined ? match[2] : argv[++index];
     if (value === undefined) throw new Error(`选项 ${argument} 需要一个值`);
     const key = names[match[1]];
-    options[key] = ["proxyPort", "tlsPort", "httpPort", "dnsPort", "adminPort", "threads", "readAhead", "readAheadSeconds", "readAheadMax", "cache", "bypassAfter", "bypassMinutes"].includes(key) ? Number(value) : value;
+    if (key === "tlsPort") options.tlsPort = String(value).split(",").map((item) => Number(item.trim())).filter((item) => Number.isInteger(item) && item >= 0);
+    else options[key] = ["proxyPort", "httpPort", "dnsPort", "adminPort", "threads", "readAhead", "readAheadSeconds", "readAheadMax", "cache", "bypassAfter", "bypassMinutes"].includes(key) ? Number(value) : value;
   }
   return options;
 }
@@ -123,9 +124,10 @@ async function main() {
   const live = liveOn ? createLiveCache({ shared, upstream, log, getSettings: () => settings }) : null;
   const proxy = createProxyServer({ authority, cache, live, upstream, shared, log, bypassAfter: options.bypassAfter, bypassMs: options.bypassMinutes * 60 * 1000 });
   let dns = null;
-  const ports = { proxy: options.proxyPort, tls: options.tlsPort, http: options.httpPort, dns: options.dnsPort, admin: options.adminPort };
+  const ports = { proxy: options.proxyPort, tls: options.tlsPort.filter((port) => port > 0).join(","), http: options.httpPort, dns: options.dnsPort, admin: options.adminPort };
   try {
-    await proxy.listen({ host: options.listen, proxyPort: options.proxyPort || null, tlsPort: options.tlsPort || null, httpPort: options.httpPort || null });
+    const tlsPorts = options.tlsPort.filter((port) => port > 0);
+    await proxy.listen({ host: options.listen, proxyPort: options.proxyPort || null, tlsPort: tlsPorts.length ? tlsPorts : null, httpPort: options.httpPort || null });
     if (options.dnsPort) {
       dns = createDnsServer({ answerIp: lanIp, isIntercept: isInterceptHost, upstreams: dnsServers, log });
       await dns.listen(options.dnsPort, options.listen);
@@ -147,7 +149,7 @@ async function main() {
   console.log("线程撕裂者 局域网代理 已启动");
   console.log(`  状态页 / 证书下载   http://${lanIp}:${options.adminPort}/   （实时日志也在这里）`);
   if (options.proxyPort) console.log(`  HTTP 代理           ${lanIp}:${options.proxyPort}`);
-  if (options.tlsPort) console.log(`  透明代理 TLS 端口   ${options.tlsPort}`);
+  if (ports.tls) console.log(`  透明代理 TLS 端口   ${ports.tls}`);
   if (options.httpPort) console.log(`  透明代理 HTTP 端口  ${options.httpPort}`);
   if (options.dnsPort) console.log(`  内置 DNS            ${lanIp}:${options.dnsPort}（上游 ${dnsServers.join(", ")}）`);
   console.log(`  下载                ${modeName}，${settings.concurrency} 条线程上限，预读 ${options.readAhead > 0 ? `${options.readAheadSeconds} 秒（没有索引时 ${options.readAhead} 倍请求长度，最多 ${options.readAheadMax} MiB）` : "关闭"}`);

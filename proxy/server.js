@@ -182,7 +182,9 @@ function createProxyServer(options) {
   const httpServer = http.createServer((request, response) => handleRequest(request, response, "http"));
   const proxyServer = http.createServer((request, response) => handleRequest(request, response, "proxy"));
   proxyServer.on("connect", handleConnect);
-  const transparentServer = net.createServer(handleTransparentTls);
+  // One transparent TLS listener per port: 443 for the CDN nodes, and 4483 for the PCDN
+  // relays when the DNS deployment points those names here too.
+  const transparentServers = [];
   for (const server of [httpsServer, httpServer, proxyServer]) {
     server.keepAliveTimeout = 30000;
     server.requestTimeout = 0;
@@ -494,10 +496,18 @@ function createProxyServer(options) {
     listening,
     httpsServer,
     isInterceptHost,
-    // A port of null stays closed; 0 takes any free port.
+    // A port of null stays closed; 0 takes any free port. tlsPort may be a list of ports.
     async listen({ host = "0.0.0.0", proxyPort = null, tlsPort = null, httpPort = null } = {}) {
       if (proxyPort != null) listening.proxy = await listenOn(proxyServer, proxyPort, host);
-      if (tlsPort != null) listening.tls = await listenOn(transparentServer, tlsPort, host);
+      if (tlsPort != null) {
+        listening.tlsAll = [];
+        for (const port of [].concat(tlsPort)) {
+          const server = net.createServer(handleTransparentTls);
+          transparentServers.push(server);
+          listening.tlsAll.push(await listenOn(server, port, host));
+        }
+        listening.tls = listening.tlsAll[0];
+      }
       if (httpPort != null) listening.http = await listenOn(httpServer, httpPort, host);
       return listening;
     },
@@ -510,7 +520,7 @@ function createProxyServer(options) {
       return { ...stats, listening: { ...listening }, bypass: { after: bypass.after, ms: bypass.ms }, untrusted };
     },
     close() {
-      for (const server of [proxyServer, transparentServer, httpServer, httpsServer]) {
+      for (const server of [proxyServer, ...transparentServers, httpServer, httpsServer]) {
         try { server.close(); } catch (_error) {}
         try { server.closeAllConnections?.(); } catch (_error) {}
       }
