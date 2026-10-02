@@ -418,13 +418,19 @@ function createProxyServer(options) {
     if (!target) return socket.end("HTTP/1.1 400 Bad Request\r\n\r\n");
     // 4483 is the port of the PCDN relays (xxx.mcdn.bilivideo.cn), whose addresses the live
     // module turns back into official nodes.
+    const ip = clientIp(socket);
     if ((target.port === 443 || (live && target.port === 4483)) && isInterceptHost(target.host)) {
-      if (isBypassed(clientIp(socket))) stats.bypassed += 1;
-      else {
+      if (isBypassed(ip)) {
+        stats.bypassed += 1;
+        log("debug", `CONNECT ${target.host}:${target.port} 来自 ${ip}：这台设备在放行期，原样隧道`);
+      } else {
         stats.tlsIntercepted += 1;
+        log("debug", `CONNECT ${target.host}:${target.port} 来自 ${ip}：接管 TLS`);
         socket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
         return adopt(socket, head);
       }
+    } else {
+      log("debug", `CONNECT ${target.host}:${target.port} 来自 ${ip}：不是视频域名，原样隧道`);
     }
     stats.tunnels += 1;
     upstream.connect(target.host, target.port).then((server) => {
@@ -461,11 +467,16 @@ function createProxyServer(options) {
         return socket.destroy();
       }
       if (peek.sni && isInterceptHost(peek.sni)) {
-        if (isBypassed(clientIp(socket))) stats.bypassed += 1;
-        else {
+        if (isBypassed(clientIp(socket))) {
+          stats.bypassed += 1;
+          log("debug", `TLS ${peek.sni} 来自 ${clientIp(socket)}：这台设备在放行期，拼接到真实服务器`);
+        } else {
           stats.tlsIntercepted += 1;
+          log("debug", `TLS ${peek.sni} 来自 ${clientIp(socket)}：接管`);
           return adopt(socket);
         }
+      } else if (peek.sni) {
+        log("debug", `TLS ${peek.sni} 来自 ${clientIp(socket)}：不是视频域名，拼接到真实服务器`);
       }
       if (!peek.sni) {
         log("debug", "TLS 连接没有带服务器名，无法知道要转发到哪里");
