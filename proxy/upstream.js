@@ -75,9 +75,16 @@ function createUpstream(options = {}) {
   };
   const httpsAgent = new https.Agent({ ...agentOptions, ca: options.ca });
   const httpAgent = new http.Agent(agentOptions);
+  // Passed-through requests go to any server on the internet, and a reused idle connection
+  // that the far end has just closed fails with "socket hang up" (WeChat's long-polling
+  // servers do this constantly). Those requests are not where the speed is, so each one
+  // gets its own connection.
+  const plainOptions = { keepAlive: false, timeout: 60000, lookup };
+  const passthroughHttpsAgent = new https.Agent({ ...plainOptions, ca: options.ca });
+  const passthroughHttpAgent = new http.Agent(plainOptions);
   const targetPort = (protocol, port) => Number(port) || options.port?.[protocol] || (protocol === "https:" ? 443 : 80);
 
-  function requestOptions(target, method, headers) {
+  function requestOptions(target, method, headers, passthrough = false) {
     const protocol = target.protocol === "http:" && !options.forceHttps ? "http:" : "https:";
     return {
       protocol,
@@ -86,16 +93,17 @@ function createUpstream(options = {}) {
       path: `${target.pathname}${target.search}`,
       method,
       headers,
-      agent: protocol === "https:" ? httpsAgent : httpAgent,
+      agent: protocol === "https:" ? (passthrough ? passthroughHttpsAgent : httpsAgent) : (passthrough ? passthroughHttpAgent : httpAgent),
       servername: protocol === "https:" ? target.hostname : undefined,
       ca: options.ca,
       lookup
     };
   }
 
-  function rawRequest(target, method, headers) {
+  // passthrough: a request relayed for a client as it is, on a connection of its own.
+  function rawRequest(target, method, headers, passthrough = false) {
     const parsed = target instanceof URL ? target : new URL(String(target));
-    const settings = requestOptions(parsed, method, headers);
+    const settings = requestOptions(parsed, method, headers, passthrough);
     return (settings.protocol === "https:" ? https : http).request(settings);
   }
 
@@ -191,6 +199,8 @@ function createUpstream(options = {}) {
     destroy() {
       httpsAgent.destroy();
       httpAgent.destroy();
+      passthroughHttpsAgent.destroy();
+      passthroughHttpAgent.destroy();
     }
   });
 }

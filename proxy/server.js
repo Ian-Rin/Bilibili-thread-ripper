@@ -357,7 +357,7 @@ function createProxyServer(options) {
     headers.host = url.host;
     headers[LOOP_HEADER] = "1";
     let outgoing;
-    try { outgoing = upstream.rawRequest(url, request.method, headers); }
+    try { outgoing = upstream.rawRequest(url, request.method, headers, true); }
     catch (error) { return respond(response, 502, `无法转发：${error.message}`); }
     const stop = () => { if (!response.writableFinished) outgoing.destroy(); };
     response.once("close", stop);
