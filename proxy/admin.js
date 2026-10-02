@@ -76,7 +76,8 @@ async function tick(){
       ["当前线程",c.activeThreads],["总速度",fmt(c.totalSpeedBps)+"/s"],["加速请求",p.accelerated],["预读命中",c.aheadHits],
       ["已加速数据",fmt(c.servedBytes)],["内存缓存",fmt(c.cacheBytes)],["直接转发",p.passthrough],["交回原连接",p.fallbacks],
       ["TLS 接管连接",p.tlsIntercepted],["普通隧道",p.tunnels+p.spliced],["放行的连接",p.bypassed],["CDN 模式",c.settings.mode==="overseas"?"海外":c.settings.mode==="custom"?"自定义":"大陆"],["线程上限",c.settings.concurrency],
-      ["直播分片",s.live?s.live.segments:"关"],["直播预取命中",s.live?s.live.segmentHits:"关"]
+      ["直播分片",s.live?s.live.segments:"关"],["直播预取命中",s.live?s.live.segmentHits:"关"],
+      ["DNS 指路",s.dns?s.dns.answered:"关"],["DNS 转发",s.dns?s.dns.forwarded:"关"]
     ].map(([k,v])=>'<div class="tile"><span class="muted">'+k+'</span><b>'+esc(v)+'</b></div>').join("");
     document.getElementById("nodes").innerHTML=(c.nodes||[]).map((n)=>'<tr><td>'+esc(n.host)+'</td><td class="'+(n.state==="healthy"?"ok":n.state==="untested"?"muted":"bad")+'">'+esc({healthy:"正常",untested:"未测",blocked:"暂停",banned:"停用"}[n.state]||n.state)+'</td><td>'+(n.bps?fmt(n.bps)+"/s":"")+'</td></tr>').join("")||'<tr><td colspan=3 class="muted">还没有下载</td></tr>';
     document.getElementById("files").innerHTML=(c.files||[]).map((f)=>'<tr><td><code>'+esc(f.path.split("/").pop())+'</code></td><td>'+(f.kind==="audio"?"声音":"画面")+'</td><td>'+(f.total?fmt(f.total):"")+'</td><td>'+(f.segments?f.segments+" 段":'<span class="muted">无</span>')+'</td><td>'+(f.playhead==null?'<span class="muted">未知</span>':f.playhead.toFixed(1)+" s"+(f.requestedAhead!=null?'，已请求到 +'+f.requestedAhead.toFixed(0)+' s':""))+'</td><td>'+f.requests+'</td><td>'+f.pieces.length+'（'+fmt(f.pieces.reduce((a,b)=>a+b.received,0))+'）</td></tr>').join("")||'<tr><td colspan=7 class="muted">没有正在播放的视频</td></tr>';

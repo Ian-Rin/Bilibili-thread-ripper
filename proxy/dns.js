@@ -80,6 +80,7 @@ function createDnsServer(options) {
     if (query.klass === 1 && isIntercept(query.name)) {
       if (query.type === TYPE_A) {
         stats.answered += 1;
+        log("debug", `DNS 指路 ${query.name} → ${answerIp}（${remote.address}）`);
         socket.send(buildAnswer(query, [answerIp], ttl), remote.port, remote.address);
         return;
       }
