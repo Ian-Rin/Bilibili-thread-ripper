@@ -350,6 +350,8 @@ function createProxyServer(options) {
 
   function passthrough(request, response, url) {
     stats.passthrough += 1;
+    // The path without its query: a signed address must not end up in a log.
+    log("debug", `转发 ${request.method} ${url.host}${url.pathname.slice(0, 80)}`);
     const headers = { ...request.headers };
     for (const name of HOP_BY_HOP) delete headers[name];
     headers.host = url.host;
@@ -433,6 +435,9 @@ function createProxyServer(options) {
       log("debug", `CONNECT ${target.host}:${target.port} 来自 ${ip}：不是视频域名，原样隧道`);
     }
     stats.tunnels += 1;
+    // Which hosts a device talks to past the proxy is the first thing to know when its
+    // video is not being accelerated: an app may use CDN names the web player does not.
+    log("debug", `隧道 ${target.host}:${target.port}`);
     upstream.connect(target.host, target.port).then((server) => {
       if (socket.destroyed) return server.destroy();
       socket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
@@ -483,6 +488,7 @@ function createProxyServer(options) {
         return socket.destroy();
       }
       stats.spliced += 1;
+      log("debug", `拼接 ${peek.sni}:443`);
       upstream.connect(peek.sni, 443).then((server) => {
         if (socket.destroyed) return server.destroy();
         tunnel(socket, server);
