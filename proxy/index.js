@@ -69,14 +69,21 @@ function detectLanIp() {
   return candidates[0]?.address || "127.0.0.1";
 }
 
-function makeLogger(verbose) {
-  return (level, message) => {
-    if (level === "debug" && !verbose) return;
+// Every line also goes into a ring buffer that the status page shows, so a phone on the
+// LAN can watch the proxy work without a terminal; the console gets the debug lines only
+// with --verbose.
+function makeLogger(verbose, buffer = []) {
+  const logger = (level, message) => {
     const stamp = new Date().toISOString().slice(11, 19);
     const line = `${stamp} ${{ error: "错误", warn: "注意", info: "    ", debug: "    " }[level] || "    "} ${message}`;
+    buffer.push({ at: Date.now(), level, line });
+    if (buffer.length > 400) buffer.shift();
+    if (level === "debug" && !verbose) return;
     if (level === "error" || level === "warn") console.error(line);
     else console.log(line);
   };
+  logger.lines = buffer;
+  return logger;
 }
 
 async function main() {
@@ -125,6 +132,7 @@ async function main() {
     }
     const admin = createAdminServer({
       authority, lanIp, ports,
+      logs: () => log.lines,
       status: () => ({ at: new Date().toISOString(), lanIp, ports, cache: cache.status(), live: live ? live.status() : null, proxy: proxy.status(), dns: dns?.stats || null })
     });
     await admin.listen(options.adminPort, options.listen);
@@ -137,7 +145,7 @@ async function main() {
   const modeName = settings.mode === "overseas" ? "海外 CDN" : settings.mode === "custom" ? `自定义 ${settings.customHosts.length} 个服务器` : "大陆 CDN";
   console.log("");
   console.log("线程撕裂者 局域网代理 已启动");
-  console.log(`  状态页 / 证书下载   http://${lanIp}:${options.adminPort}/`);
+  console.log(`  状态页 / 证书下载   http://${lanIp}:${options.adminPort}/   （实时日志也在这里）`);
   if (options.proxyPort) console.log(`  HTTP 代理           ${lanIp}:${options.proxyPort}`);
   if (options.tlsPort) console.log(`  透明代理 TLS 端口   ${options.tlsPort}`);
   if (options.httpPort) console.log(`  透明代理 HTTP 端口  ${options.httpPort}`);

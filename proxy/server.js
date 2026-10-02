@@ -366,6 +366,7 @@ function createProxyServer(options) {
       incoming.once("error", () => response.destroy());
     });
     outgoing.once("error", (error) => {
+      log("debug", `转发 ${url.host} 失败：${error.message}`);
       if (!response.headersSent) respond(response, 502, `上游请求失败：${error.message}`);
       else response.destroy();
     });

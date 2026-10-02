@@ -60,6 +60,10 @@ ol li,ul li{margin:4px 0}
 <h2>不信任证书的设备</h2>
 <p class="muted">这些设备连接 B 站视频服务器时 TLS 握手失败，多半是没装证书（安卓 App 不认用户证书）。连续失败几次后代理会自动放行它们一段时间：能看，但不加速。在设备上装好证书后等放行到期即可。</p>
 <table><thead><tr><th>设备</th><th>状态</th><th>失败次数</th><th>最近错误</th></tr></thead><tbody id="untrusted"></tbody></table>
+<h2>实时日志</h2>
+<p class="muted">最近 400 行，每秒刷新。每个加速的请求、预读命中、节点停用、握手失败、直播分片都在这里；<a href="${base}/log.txt">/log.txt</a> 是纯文本。</p>
+<label class="muted"><input type="checkbox" id="follow" checked> 自动滚到最新</label>
+<pre id="log" style="max-height:360px;overflow:auto;font-size:12px;line-height:1.45;border:1px solid var(--line);border-radius:8px;padding:8px;white-space:pre-wrap;word-break:break-all"></pre>
 <p class="muted">这个页面每秒刷新一次状态；数据也可以从 <a href="${base}/stats.json">/stats.json</a> 读取。</p>
 <script>
 const fmt=(n)=>{n=Number(n)||0;if(n>=1073741824)return (n/1073741824).toFixed(2)+" GiB";if(n>=1048576)return (n/1048576).toFixed(1)+" MiB";if(n>=1024)return (n/1024).toFixed(0)+" KiB";return n+" B"};
@@ -79,6 +83,11 @@ async function tick(){
     const l=s.live; document.getElementById("streams").innerHTML=l?((l.streams||[]).map((st)=>'<tr><td><code>'+esc(st.key)+'</code></td><td>'+st.cached+'</td><td>'+st.lastNum+'</td><td>'+st.hosts.map((h)=>'<span class="'+(h.state==="healthy"?"ok":h.state==="untested"?"muted":"bad")+'">'+esc(h.host.split(".")[0])+'</span>').join(" · ")+'</td></tr>').join("")||'<tr><td colspan=4 class="muted">没有正在看的直播</td></tr>'):'<tr><td colspan=4 class="muted">直播加速已关闭</td></tr>';
     document.getElementById("untrusted").innerHTML=(p.untrusted||[]).map((u)=>'<tr><td><code>'+esc(u.ip)+'</code></td><td class="'+(u.bypassed?"bad":"muted")+'">'+(u.bypassed?"已放行，还剩 "+Math.ceil(u.bypassForMs/60000)+" 分钟":"握手失败中")+'</td><td>'+u.failures+'</td><td class="muted">'+esc(u.lastError||"")+'</td></tr>').join("")||'<tr><td colspan=4 class="muted">没有</td></tr>';
   }catch(e){}
+  try{
+    const text=await (await fetch("/log.txt",{cache:"no-store"})).text();
+    const pre=document.getElementById("log");
+    if(pre.textContent!==text){ pre.textContent=text; if(document.getElementById("follow").checked) pre.scrollTop=pre.scrollHeight; }
+  }catch(e){}
 }
 tick();setInterval(tick,1000);
 </script>
@@ -96,6 +105,11 @@ function createAdminServer(context) {
     if (url.pathname === "/ca.cer" || url.pathname === "/ca.der") {
       response.writeHead(200, { "Content-Type": "application/x-x509-ca-cert", "Content-Disposition": "attachment; filename=\"btr-lan-proxy-ca.cer\"", "Cache-Control": "no-store" });
       return response.end(authority.certificateDer);
+    }
+    if (url.pathname === "/log.txt") {
+      const lines = typeof context.logs === "function" ? context.logs() : [];
+      response.writeHead(200, { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" });
+      return response.end(lines.map((item) => item.line).join("\n"));
     }
     if (url.pathname === "/stats.json") {
       response.writeHead(200, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store", "Access-Control-Allow-Origin": "*" });
